@@ -1,0 +1,18 @@
+[package]
+name = "symphonia-c"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+symphonia = { version = "0.6", default-features = false, features = [
+    "flac",
+    "mpa",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+    "opt-simd",
+] }
