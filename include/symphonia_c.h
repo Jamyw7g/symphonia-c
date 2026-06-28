@@ -39,6 +39,25 @@ uint32_t symphonia_c_channels(const symphonia_c_decoder_t *decoder);
 uint64_t symphonia_c_total_frames(const symphonia_c_decoder_t *decoder);
 
 /*
+ * Seeks to a frame offset from the start of the selected audio track.
+ * The next symphonia_c_read_f32 call starts at the requested frame when the
+ * underlying format can seek to or before it. out_actual_frame may be NULL.
+ */
+symphonia_c_status_t symphonia_c_seek_frame(
+    symphonia_c_decoder_t *decoder,
+    uint64_t frame,
+    uint64_t *out_actual_frame);
+
+/*
+ * Seeks to a time offset in seconds from the start of the selected audio track.
+ * out_actual_seconds may be NULL.
+ */
+symphonia_c_status_t symphonia_c_seek_seconds(
+    symphonia_c_decoder_t *decoder,
+    double seconds,
+    double *out_actual_seconds);
+
+/*
  * Reads interleaved float32 PCM into out_samples.
  * out_samples must have room for frame_capacity * symphonia_c_channels(decoder) floats.
  * Returns SYMPHONIA_C_END_OF_STREAM when no more frames are available.

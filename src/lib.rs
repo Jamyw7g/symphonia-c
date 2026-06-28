@@ -11,9 +11,10 @@ use symphonia::core::codecs::CodecParameters;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::units::{Duration, TimeBase, Timestamp};
 
 pub const SYMPHONIA_C_OK: i32 = 0;
 pub const SYMPHONIA_C_END_OF_STREAM: i32 = 1;
@@ -54,6 +55,8 @@ pub struct SymphoniaCDecoder {
     sample_rate: u32,
     channels: u32,
     total_frames: u64,
+    time_base: Option<TimeBase>,
+    start_ts: Timestamp,
     pending: Vec<f32>,
     pending_offset: usize,
     eof: bool,
@@ -114,7 +117,7 @@ impl SymphoniaCDecoder {
         let meta_opts = MetadataOptions::default();
         let format = symphonia::default::get_probe().probe(&hint, mss, fmt_opts, meta_opts)?;
 
-        let (track_id, sample_rate, channels, total_frames, decoder) = {
+        let (track_id, sample_rate, channels, total_frames, time_base, start_ts, decoder) = {
             let track = format
                 .default_track(TrackType::Audio)
                 .ok_or_else(|| ApiError::new(SYMPHONIA_C_UNSUPPORTED, "no audio track found"))?;
@@ -141,6 +144,8 @@ impl SymphoniaCDecoder {
                     .map(|channels| channels.count() as u32)
                     .unwrap_or(0),
                 track.num_frames.unwrap_or(0),
+                track.time_base,
+                track.start_ts,
                 decoder,
             )
         };
@@ -152,6 +157,8 @@ impl SymphoniaCDecoder {
             sample_rate,
             channels,
             total_frames,
+            time_base,
+            start_ts,
             pending: Vec::new(),
             pending_offset: 0,
             eof: false,
@@ -198,6 +205,28 @@ impl SymphoniaCDecoder {
         Ok(written / channels)
     }
 
+    fn seek_frame(&mut self, frame: u64) -> Result<u64, ApiError> {
+        let target_ts = self.timestamp_from_frame(frame)?;
+        let actual_ts = self.seek_to_timestamp(target_ts)?;
+        let frames_to_skip = self.frames_between_timestamps(actual_ts, target_ts)?;
+        let frames_skipped = self.skip_frames(frames_to_skip)?;
+
+        if frames_skipped == frames_to_skip {
+            Ok(frame)
+        } else {
+            Ok(self
+                .frame_from_timestamp(actual_ts)?
+                .saturating_add(frames_skipped))
+        }
+    }
+
+    fn seek_seconds(&mut self, seconds: f64) -> Result<f64, ApiError> {
+        let frame = self.frame_from_seconds(seconds)?;
+        let actual_frame = self.seek_frame(frame)?;
+
+        Ok(self.seconds_from_frame(actual_frame)?)
+    }
+
     fn channel_count(&self) -> Result<usize, ApiError> {
         if self.channels == 0 {
             return Err(ApiError::new(
@@ -207,6 +236,109 @@ impl SymphoniaCDecoder {
         }
 
         Ok(self.channels as usize)
+    }
+
+    fn sample_rate(&self) -> Result<u32, ApiError> {
+        if self.sample_rate == 0 {
+            return Err(ApiError::new(
+                SYMPHONIA_C_UNSUPPORTED,
+                "audio sample rate is unknown",
+            ));
+        }
+
+        Ok(self.sample_rate)
+    }
+
+    fn seek_time_base(&self) -> Result<TimeBase, ApiError> {
+        if let Some(time_base) = self.time_base {
+            return Ok(time_base);
+        }
+
+        TimeBase::try_from_recip(self.sample_rate()?).ok_or_else(|| {
+            ApiError::new(SYMPHONIA_C_UNSUPPORTED, "audio track time base is unknown")
+        })
+    }
+
+    fn timestamp_from_frame(&self, frame: u64) -> Result<Timestamp, ApiError> {
+        let sample_rate = u128::from(self.sample_rate()?);
+        let time_base = self.seek_time_base()?;
+        let numerator = u128::from(frame)
+            .checked_mul(u128::from(time_base.denom.get()))
+            .ok_or_else(|| ApiError::invalid_argument("seek frame overflows timestamp"))?;
+        let denominator = sample_rate
+            .checked_mul(u128::from(time_base.numer.get()))
+            .ok_or_else(|| ApiError::invalid_argument("seek frame overflows timestamp"))?;
+        let offset_ticks = numerator / denominator;
+        let offset_ticks = i64::try_from(offset_ticks)
+            .map_err(|_| ApiError::invalid_argument("seek frame overflows timestamp"))?;
+
+        self.timestamp_from_offset(Timestamp::new(offset_ticks))
+    }
+
+    fn timestamp_from_offset(&self, offset: Timestamp) -> Result<Timestamp, ApiError> {
+        if offset.is_negative() {
+            return Err(ApiError::invalid_argument(
+                "seek offset must not be negative",
+            ));
+        }
+
+        let offset = u64::try_from(offset.get())
+            .ok()
+            .map(Duration::from)
+            .ok_or_else(|| ApiError::invalid_argument("seek offset overflows timestamp"))?;
+
+        self.start_ts
+            .checked_add(offset)
+            .ok_or_else(|| ApiError::invalid_argument("seek target overflows timestamp"))
+    }
+
+    fn frame_from_timestamp(&self, timestamp: Timestamp) -> Result<u64, ApiError> {
+        let Some(delta) = timestamp.duration_from(self.start_ts) else {
+            return Ok(0);
+        };
+
+        self.frames_from_duration(delta)
+    }
+
+    fn frames_between_timestamps(&self, start: Timestamp, end: Timestamp) -> Result<u64, ApiError> {
+        let Some(delta) = end.duration_from(start) else {
+            return Ok(0);
+        };
+
+        self.frames_from_duration(delta)
+    }
+
+    fn frames_from_duration(&self, duration: Duration) -> Result<u64, ApiError> {
+        let time_base = self.seek_time_base()?;
+        let numerator = u128::from(duration.get())
+            .checked_mul(u128::from(self.sample_rate()?))
+            .and_then(|value| value.checked_mul(u128::from(time_base.numer.get())))
+            .ok_or_else(|| ApiError::invalid_argument("seek result overflows frame count"))?;
+        let frames = numerator / u128::from(time_base.denom.get());
+
+        u64::try_from(frames)
+            .map_err(|_| ApiError::invalid_argument("seek result overflows frame count"))
+    }
+
+    fn frame_from_seconds(&self, seconds: f64) -> Result<u64, ApiError> {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(ApiError::invalid_argument(
+                "seek seconds must be finite and non-negative",
+            ));
+        }
+
+        let frames = seconds * f64::from(self.sample_rate()?);
+        if !frames.is_finite() || frames > u64::MAX as f64 {
+            return Err(ApiError::invalid_argument(
+                "seek seconds overflow frame count",
+            ));
+        }
+
+        Ok(frames.floor() as u64)
+    }
+
+    fn seconds_from_frame(&self, frame: u64) -> Result<f64, ApiError> {
+        Ok(frame as f64 / f64::from(self.sample_rate()?))
     }
 
     fn drain_pending(&mut self, out: &mut [f32]) -> usize {
@@ -226,6 +358,78 @@ impl SymphoniaCDecoder {
         }
 
         count
+    }
+
+    fn seek_to_timestamp(&mut self, timestamp: Timestamp) -> Result<Timestamp, ApiError> {
+        let seeked_to = self.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Timestamp {
+                ts: timestamp,
+                track_id: self.track_id,
+            },
+        )?;
+
+        self.decoder.reset();
+        self.pending.clear();
+        self.pending_offset = 0;
+        self.eof = false;
+
+        Ok(seeked_to.actual_ts)
+    }
+
+    fn skip_frames(&mut self, frames: u64) -> Result<u64, ApiError> {
+        if frames == 0 {
+            return Ok(0);
+        }
+
+        let channels = u64::try_from(self.channel_count()?)
+            .map_err(|_| ApiError::invalid_argument("channel count overflows sample count"))?;
+        let mut samples_to_skip = frames
+            .checked_mul(channels)
+            .ok_or_else(|| ApiError::invalid_argument("seek frame overflows sample count"))?;
+        let mut samples_skipped = 0u64;
+
+        while samples_to_skip > 0 {
+            let pending_remaining =
+                u64::try_from(self.pending.len().saturating_sub(self.pending_offset))
+                    .map_err(|_| ApiError::invalid_argument("pending buffer is too large"))?;
+
+            if pending_remaining > 0 {
+                let count = pending_remaining.min(samples_to_skip);
+                self.pending_offset += count as usize;
+                samples_to_skip -= count;
+                samples_skipped += count;
+
+                if self.pending_offset == self.pending.len() {
+                    self.pending.clear();
+                    self.pending_offset = 0;
+                }
+
+                continue;
+            }
+
+            match self.decode_next_samples()? {
+                Some(samples) if !samples.is_empty() => {
+                    let count = u64::try_from(samples.len())
+                        .map_err(|_| ApiError::invalid_argument("decoded buffer is too large"))?
+                        .min(samples_to_skip);
+                    samples_to_skip -= count;
+                    samples_skipped += count;
+
+                    if count < samples.len() as u64 {
+                        self.pending = samples;
+                        self.pending_offset = count as usize;
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    self.eof = true;
+                    break;
+                }
+            }
+        }
+
+        Ok(samples_skipped / channels)
     }
 
     fn decode_next_samples(&mut self) -> Result<Option<Vec<f32>>, ApiError> {
@@ -320,6 +524,48 @@ pub extern "C" fn symphonia_c_total_frames(decoder: *const SymphoniaCDecoder) ->
     };
 
     decoder.total_frames
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn symphonia_c_seek_frame(
+    decoder: *mut SymphoniaCDecoder,
+    frame: u64,
+    out_actual_frame: *mut u64,
+) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        seek_frame_impl(decoder, frame, out_actual_frame)
+    })) {
+        Ok(Ok(())) => SYMPHONIA_C_OK,
+        Ok(Err(error)) => {
+            set_decoder_or_global_error(decoder, &error.message);
+            error.status
+        }
+        Err(_) => {
+            set_decoder_or_global_error(decoder, "panic while seeking decoder");
+            SYMPHONIA_C_INTERNAL_ERROR
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn symphonia_c_seek_seconds(
+    decoder: *mut SymphoniaCDecoder,
+    seconds: f64,
+    out_actual_seconds: *mut f64,
+) -> i32 {
+    match catch_unwind(AssertUnwindSafe(|| {
+        seek_seconds_impl(decoder, seconds, out_actual_seconds)
+    })) {
+        Ok(Ok(())) => SYMPHONIA_C_OK,
+        Ok(Err(error)) => {
+            set_decoder_or_global_error(decoder, &error.message);
+            error.status
+        }
+        Err(_) => {
+            set_decoder_or_global_error(decoder, "panic while seeking decoder");
+            SYMPHONIA_C_INTERNAL_ERROR
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -426,6 +672,58 @@ fn open_file_impl(
     }
 
     set_global_error("");
+    Ok(())
+}
+
+fn seek_frame_impl(
+    decoder: *mut SymphoniaCDecoder,
+    frame: u64,
+    out_actual_frame: *mut u64,
+) -> Result<(), ApiError> {
+    if !out_actual_frame.is_null() {
+        unsafe {
+            *out_actual_frame = 0;
+        }
+    }
+
+    let decoder = unsafe { decoder.as_mut() }
+        .ok_or_else(|| ApiError::invalid_argument("decoder must not be null"))?;
+    decoder.clear_error();
+
+    let actual_frame = decoder.seek_frame(frame)?;
+
+    if !out_actual_frame.is_null() {
+        unsafe {
+            *out_actual_frame = actual_frame;
+        }
+    }
+
+    Ok(())
+}
+
+fn seek_seconds_impl(
+    decoder: *mut SymphoniaCDecoder,
+    seconds: f64,
+    out_actual_seconds: *mut f64,
+) -> Result<(), ApiError> {
+    if !out_actual_seconds.is_null() {
+        unsafe {
+            *out_actual_seconds = 0.0;
+        }
+    }
+
+    let decoder = unsafe { decoder.as_mut() }
+        .ok_or_else(|| ApiError::invalid_argument("decoder must not be null"))?;
+    decoder.clear_error();
+
+    let actual_seconds = decoder.seek_seconds(seconds)?;
+
+    if !out_actual_seconds.is_null() {
+        unsafe {
+            *out_actual_seconds = actual_seconds;
+        }
+    }
+
     Ok(())
 }
 
@@ -613,6 +911,67 @@ mod tests {
         let status = symphonia_c_read_f32(decoder, samples.as_mut_ptr(), 2, &mut frames);
         assert_eq!(status, SYMPHONIA_C_END_OF_STREAM);
         assert_eq!(frames, 0);
+
+        symphonia_c_free(decoder);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn seeks_wav_stream_by_frame() {
+        let path = write_test_wav("seek_frame");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mut decoder = ptr::null_mut();
+
+        let status = symphonia_c_open_file(c_path.as_ptr(), &mut decoder);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(ptr::null()));
+
+        let mut samples = [0.0; 8];
+        let mut frames = 0;
+        let status = symphonia_c_read_f32(decoder, samples.as_mut_ptr(), 4, &mut frames);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(decoder));
+        assert_eq!(frames, 4);
+
+        let status = symphonia_c_read_f32(decoder, samples.as_mut_ptr(), 4, &mut frames);
+        assert_eq!(status, SYMPHONIA_C_END_OF_STREAM);
+        assert_eq!(frames, 0);
+
+        let mut actual_frame = 0;
+        let status = symphonia_c_seek_frame(decoder, 1, &mut actual_frame);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(decoder));
+        assert_eq!(actual_frame, 1);
+
+        let mut frame = [0.0; 2];
+        let status = symphonia_c_read_f32(decoder, frame.as_mut_ptr(), 1, &mut frames);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(decoder));
+        assert_eq!(frames, 1);
+        assert!(frame[0] > 0.9);
+        assert!(frame[1] < -0.9);
+
+        symphonia_c_free(decoder);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn seeks_wav_stream_by_seconds() {
+        let path = write_test_wav("seek_seconds");
+        let c_path = CString::new(path.to_string_lossy().as_bytes()).unwrap();
+        let mut decoder = ptr::null_mut();
+
+        let status = symphonia_c_open_file(c_path.as_ptr(), &mut decoder);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(ptr::null()));
+
+        let mut actual_seconds = 0.0;
+        let status = symphonia_c_seek_seconds(decoder, 2.0 / 44_100.0, &mut actual_seconds);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(decoder));
+        assert!((actual_seconds - (2.0 / 44_100.0)).abs() < 1e-12);
+
+        let mut frame = [0.0; 2];
+        let mut frames = 0;
+        let status = symphonia_c_read_f32(decoder, frame.as_mut_ptr(), 1, &mut frames);
+        assert_eq!(status, SYMPHONIA_C_OK, "{}", last_error(decoder));
+        assert_eq!(frames, 1);
+        assert!(frame[0] > 0.4 && frame[0] < 0.6);
+        assert!(frame[1] < -0.4 && frame[1] > -0.6);
 
         symphonia_c_free(decoder);
         let _ = fs::remove_file(path);

@@ -64,4 +64,6 @@ symphonia_c_audio_buffer_free(&buffer);
 
 For streaming, use `symphonia_c_open_file`, query `symphonia_c_channels` and
 `symphonia_c_sample_rate`, repeatedly call `symphonia_c_read_f32`, then release
-the handle with `symphonia_c_free`.
+the handle with `symphonia_c_free`. Player-style seeking is available with
+`symphonia_c_seek_frame` or `symphonia_c_seek_seconds`; both reset the decoder
+state and clear any buffered samples before the next read.
